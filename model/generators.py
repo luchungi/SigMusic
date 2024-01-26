@@ -86,3 +86,55 @@ class TransformerMusic(nn.Module):
 
     def forward(self, x):
         return self._generate_sequence(x)
+
+class LSTMusic(nn.Module):
+    def __init__(self, noise_dim, seq_dim, seq_len, hidden_size=64, n_lstm_layers=1, activation='Tanh'):
+        super().__init__(noise_dim, seq_dim, seq_len, hidden_size, n_lstm_layers, activation)
+        self.gen_type = 'LSTMd'
+        self.seq_dim = seq_dim # dimension of the time series e.g. how many stocks
+        self.noise_dim = noise_dim # dimension of the noise vector -> vector of (noise_dim, 1) concatenated with the seq value of dimension seq_dim at each time step
+        self.seq_len = seq_len # length of the time series
+        self.hidden_size = hidden_size
+        self.n_lstm_layers = n_lstm_layers
+
+        activation = getattr(nn, activation)
+        self.rnn = nn.LSTM(input_size=seq_dim+noise_dim+1, hidden_size=hidden_size, num_layers=n_lstm_layers, batch_first=True, bidirectional=False)
+        self.output_net = nn.Linear(hidden_size, seq_dim)
+
+    def _condition_lstm(self, noise, hist_x, t):
+        batch_size = noise.shape[0] # noise shape: batch_size, seq_len, noise_dim
+        h = torch.zeros(self.n_lstm_layers, batch_size, self.hidden_size, requires_grad=False, device=noise.device)
+        c = torch.zeros(self.n_lstm_layers, batch_size, self.hidden_size, requires_grad=False, device=noise.device)
+        # x = torch.zeros(batch_size, 1, self.seq_dim, requires_grad=False, device=noise.device)
+        seq = []
+
+        dts = t.diff(dim=1)
+        if hist_x is not None: # feed in the historical data to get the hidden state
+            diff_x = hist_x.diff(dim=1) # get the log increments (returns) which reduces the dim by 1
+            for i in range(diff_x.shape[1]):
+                dt = dts[:,i:i+1,:]
+                x = diff_x[:,i:i+1,:]
+                input = torch.cat([x, noise[:,i:i+1,:], dt], dim=-1)
+                _, (h, c) = self.rnn(input, (h, c))
+                seq.append(x)
+            x = seq[-1] # set the last x as the last return
+            noise = noise[:,diff_x.shape[1]:,:] # set the noise to start from the end of the historical data
+            dts = dts[:,diff_x.shape[1]:,:] # continue from the last dt
+        return x, noise, dts, h, c, seq
+
+    def _generate_sequence(self, x, seq, noise, dts, h, c, detach=False):
+        # print(self.seq_len, len(seq), dts.shape, noise.shape)
+        for i in range(self.seq_len-len(seq)): # iterate over the remaining time steps
+            dt = dts[:,i:i+1,:]
+            # print(x.shape, noise[:,i:i+1,:].shape, dt.shape)
+            input = torch.cat([(x.detach() if detach else x), noise[:,i:i+1,:], dt], dim=-1) # len=1, batch_size, input_size=X.shape[-1]+noise_dim+1 for dt
+            output, (h, c) = self.rnn(input, (h, c))
+            x = self.output_net(output)
+            seq.append(x)
+        output_seq = torch.cat(seq, dim=1)
+        return output_seq
+
+    def forward(self, noise, t, hist_x=None, abs_path=False, abs_returns=False):
+        x, noise, dts, h, c, seq = self._condition_lstm(noise, hist_x, t)
+        output_seq = self._generate_sequence(x, seq, noise, dts, h, c)
+        return self._return_output_seq(output_seq, None, abs_path, abs_returns)
