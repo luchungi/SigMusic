@@ -4,6 +4,7 @@ from os.path import basename, dirname, join, exists, splitext
 import json
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import Dataset
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
@@ -141,40 +142,174 @@ def rectilinear_transform(df: pd.DataFrame, include_velocity: bool=False):
         rectilinear_path.append([row['End']] + row[2:end_idx].values.tolist())
     return np.array(rectilinear_path)
 
-def get_dfs_from_midi(dir: str, min_notes: int=1, min_gap: float=0):
+def get_dfs_from_midi(dir: str,
+                      min_notes: int=1,
+                      min_gap: float=0,
+                      note_dur_transform: bool=False):
+    '''
+    Get dataframes from midi files in dir
+    Filter out midi files where number of notes is less than min_notes
+    Filter out midi files where minimum gap between notes is less than min_gap
+    Transform dataframes to have 2 cols: duration and pitch if note_dur_transform is True
+    0 is assumed to be reserved for rest with this transformation
+    '''
     dfs = []
     for entry in os.scandir(dir):
         if entry.is_dir():
-            dfs.extend(get_dfs_from_midi(entry.path, min_notes=min_notes))
-        if entry.is_file() and (entry.name.endswith('.midi') or entry.name.endswith('.mid')):
+            dfs.extend(get_dfs_from_midi(entry.path, min_notes, min_gap, note_dur_transform))
+        elif entry.is_file() and (entry.name.endswith('.midi') or entry.name.endswith('.mid')):
             midi_data = pretty_midi.PrettyMIDI(entry.path)
             df = midi_to_df(midi_data)
+
+            # filter out midi files where gap between notes is less than min_gap
             gap = df['Start'].iloc[1:].values - df['End'].iloc[:-1].values
-            if len(df) >= min_notes and gap.min() >= min_gap:
-                dfs.append(df) # only append if midi file contains notes
+            if len(gap) ==0 or gap.min() < min_gap: continue
+
+            if note_dur_transform:
+                rows = []
+                df.loc[:, 'Pitch'] += 1 # add 1 to pitch to reserve 0 for rest
+                prev_end = None
+                for i, row in df.iterrows():
+                    note = pd.Series({'Duration': row['End'] - row['Start'], 'Pitch': row['Pitch']})
+                    if i == 0:
+                        rows.append(note)
+                        continue
+
+                    # check if previous note ends before current note starts i.e. gap between notes
+                    if prev_end is not None:
+                        if prev_end < row['Start']:
+                            # add row with duration of gap with pitch 0 (rest)
+                            rows.append(pd.Series({'Duration': row['Start'] - prev_end, 'Pitch': 0}))
+                        elif prev_end > row['Start']:
+                            raise ValueError('Overlapping notes')
+                    prev_end = row['End']
+                    rows.append(note)
+                df = pd.DataFrame(rows)
+
+            # filter out midi files where number of notes is less than min_notes
+            if len(df) < min_notes: continue
+
+            dfs.append(df) # only append if midi file contains notes
     return dfs
+
+def trim_by_range(dfs: list[pd.DataFrame], min_range: int, max_range: int, exclude_rest: bool=False):
+    '''
+    Trim dataframes to have max_range pitch range
+    '''
+    new_dfs = []
+    for df in dfs:
+        range_of_pitch = df.loc[df['Pitch'] > 0, 'Pitch'].max() - df.loc[df['Pitch'] > 0, 'Pitch'].min() if exclude_rest else df['Pitch'].max() - df['Pitch'].min()
+        if range_of_pitch >= min_range and range_of_pitch <= max_range:
+            new_dfs.append(df.copy())
+    return new_dfs
+
+def move_octaves(dfs: list[pd.DataFrame],
+                 min_pitch: Optional[int]=None,
+                 max_pitch: Optional[int]=None,
+                 center_range: Optional[list[int]]=None,
+                 exclude_rest: bool=False):
+    # assert either min_pitch and max_pitch are both not None or center is not None but not both
+    assert (min_pitch is not None and max_pitch is not None) or center_range is not None, 'Either min_pitch and max_pitch are provided or center_range is provided'
+    assert not((min_pitch is not None and max_pitch is not None) and center_range is not None), 'Either min_pitch and max_pitch are provided or center_range is provided'
+
+    new_dfs = []
+    for df in dfs:
+        df_copy = df.copy()
+        if center_range is not None:
+            center = (df_copy.loc[df_copy['Pitch'] > 0, 'Pitch'].max() + df_copy.loc[df_copy['Pitch'] > 0, 'Pitch'].min()) / 2 if exclude_rest else (df_copy['Pitch'].max() + df_copy['Pitch'].min()) / 2
+            while center < center_range[0]:
+                df_copy.loc[df_copy['Pitch'] > 0, 'Pitch'] += 12
+                center += 12
+            while center > center_range[1]:
+                df_copy.loc[df_copy['Pitch'] > 0, 'Pitch'] -= 12
+                center -= 12
+        if min_pitch is not None:
+            curr_min = df_copy.loc[df_copy['Pitch'] > 0, 'Pitch'].min() if exclude_rest else df_copy['Pitch'].min()
+            while curr_min < min_pitch:
+                df_copy.loc[df_copy['Pitch'] > 0, 'Pitch'] += 12
+                curr_min = df_copy.loc[df_copy['Pitch'] > 0, 'Pitch'].min() if exclude_rest else df_copy['Pitch'].min()
+        if max_pitch is not None:
+            curr_max = df_copy.loc[df_copy['Pitch'] > 0, 'Pitch'].max() if exclude_rest else df_copy['Pitch'].max()
+            while curr_max > max_pitch:
+                df_copy.loc[df_copy['Pitch'] > 0, 'Pitch'] -= 12
+                curr_max = df_copy.loc[df_copy['Pitch'] > 0, 'Pitch'].max() if exclude_rest else df_copy['Pitch'].max()
+        new_dfs.append(df_copy)
+    return new_dfs
+
+def pitch_range(dfs: list[pd.DataFrame]):
+    '''
+    Print and plot pitch ranges
+    '''
+    pitch_ranges = []
+    pitch_mins = []
+    pitch_maxs = []
+    for df in dfs:
+        pitch_mins.append(df.loc[df['Pitch'] > 0, 'Pitch'].min()) # exclude 0 (rest)
+        pitch_maxs.append(df.loc[df['Pitch'] > 0, 'Pitch'].max())
+        pitch_range = df['Pitch'].max() - df.loc[df['Pitch'] > 0, 'Pitch'].min()
+        pitch_ranges.append(pitch_range)
+    pitch_mins = np.array(pitch_mins)
+    pitch_maxs = np.array(pitch_maxs)
+    pitch_ranges = np.array(pitch_ranges)
+    min_pitch = pitch_mins.min()
+    max_pitch = pitch_maxs.max()
+    print('Min pitch:', min_pitch)
+    print('Max pitch:', max_pitch)
+
+    _, ax = plt.subplots(1, 3, figsize=(20, 5))
+    ax[0].hist(pitch_ranges, bins=128, range=(1, 129));
+    ax[0].set_title('Pitch range histogram')
+    ax[1].boxplot(pitch_ranges);
+    ax[1].set_title('Pitch range boxplot')
+    ax[2].boxplot((pitch_maxs+pitch_mins) / 2);
+    ax[2].set_title('Pitch range centers boxplot')
+    plt.show()
+
+    _, ax = plt.subplots(figsize=(20, 5))
+    ax.bar(range(len(pitch_mins)), height=pitch_maxs-pitch_mins, bottom=pitch_mins, width=1.0);
+    ax.scatter(range(len(pitch_mins)), (pitch_maxs+pitch_mins) / 2, color='red');
+    plt.show()
+
+    return min_pitch, max_pitch
+
+def pitch_translation(dfs: list[pd.DataFrame]):
+    '''
+    Print and plot pitch ranges
+    Translate pitch values to be between 1 and max pitch appearing in data
+    0 is assumed to be reserved for rest
+    '''
+    min_pitch, max_pitch = pitch_range(dfs) # get min and max pitch appearing in data
+    # translate pitch values to be between 1 and max pitch appearing in data
+    for df in dfs:
+        df.loc[df['Pitch'] > 0, 'Pitch'] -= (min_pitch - 1) # subtract min_pitch and add 1 to reserve 0 for rest
+    return dfs, max_pitch - min_pitch + 1
+
 class MIDIDataset(Dataset):
     '''
     Dataset for dataframes with MIDI data: 5 columns (start time, end time, pitch, velocity, instrument) in this order
     '''
-    def __init__(self, dfs: list[pd.DataFrame], sample_len: int, cols: list[int]=[0,1,2,3,4], scale: float=1., stride: int=1):
+    def __init__(self, dfs: list[pd.DataFrame], sample_len: int, cols: list[int]=[0,1,2,3], scale: float=1., stride: int=1, rectilinear: bool=False):
 
-        self.seq_dim = len(cols)
+        self.seq_dim = len(cols) - 1 if rectilinear else len(cols) # start and end time are combined into one dimension for rectilinear
         self.cols = cols
         assert 0 in cols and 1 in cols, 'start time and end time column must be included'
         assert 2 in cols, 'pitch column must be included'
         self.sample_len = sample_len
         self.scale = scale
         self.stride = stride
+        self.rectilinear = rectilinear
 
         self.tensors = []
         self.lens = []
         for df in dfs:
             if len(df) >= sample_len:
-                rectilinear_path = rectilinear_transform(df, include_velocity=(3 in cols))
-                tensor = torch.tensor(rectilinear_path, dtype=torch.float32, requires_grad=False)
-                pv_cols = [cols.index(2), cols.index(3)] if 3 in cols else [cols.index(2)]
-                tensor[:,pv_cols] = tensor[:,pv_cols] / scale # scale pitch and velocity which are integers from 0 to 127
+                if rectilinear:
+                    rectilinear_path = rectilinear_transform(df, include_velocity=(3 in cols)) # shape (n_points, 2 or 3) depending on whether velocity is included
+                    tensor = torch.tensor(rectilinear_path, dtype=torch.float32, requires_grad=False)
+                    tensor[:,1:] = (tensor[:,1:] + 1.) / scale # add 1 to pitch and velocity which are integers from 0 to 127 to reserve 0 for rest and divide by scale
+                else:
+                    tensor = torch.tensor(df.iloc[:,:self.seq_dim].values, dtype=torch.float32, requires_grad=False)# (seq_len, seq_dim)
+                    tensor[:,2:] = tensor[:,2:] / scale # scale pitch and velocity which are integers from 0 to 127
                 self.tensors.append(tensor)
                 self.lens.append(int((tensor.shape[0] - self.sample_len)/self.stride) + 1)
         self.lens = np.cumsum(self.lens)
@@ -189,9 +324,14 @@ class MIDIDataset(Dataset):
         start = idx*self.stride
         end = start + self.sample_len
         path = torch.empty((self.sample_len, self.seq_dim), dtype=torch.float32, requires_grad=False) # shape (sample_len, seq_dim)
-        path[:,:2] = self.tensors[i][start:end,:2] - self.tensors[i][start, 0] # get start and end time columns and offset so that first start time is 0
-        path[:,2:] = self.tensors[i][start:end, 2:] # get pitch and velocity columns
+        if self.rectilinear:
+            path[:,:1] = self.tensors[i][start:end,:1] - self.tensors[i][start, 0] # get start and end time columns and offset so that first start time is 0
+            path[:,1:] = self.tensors[i][start:end,1:] # get pitch and velocity columns
+        else:
+            path[:,:2] = self.tensors[i][start:end,:2] - self.tensors[i][start, 0] # get start and end time columns and offset so that first start time is 0
+            path[:,2:] = self.tensors[i][start:end, 2:] # get pitch and velocity columns
         return path
+
 class MelodyDataset(Dataset):
     '''
     Dataset for dataframes with MIDI data: 4 columns (start time, end time, pitch) in this order
