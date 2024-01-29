@@ -88,14 +88,15 @@ class TransformerMusic(nn.Module):
         return self._generate_sequence(x)
 
 class LSTMusic(nn.Module):
-    def __init__(self, seq_dim, seq_len, hidden_size=64, n_lstm_layers=1, activation='Tanh'):
-        super().__init__(seq_dim, seq_len, hidden_size, n_lstm_layers, activation)
+    def __init__(self, seq_dim: int, seq_len: int, max_pitch: int, hidden_size:int =64, n_lstm_layers: int=1, activation: str='Tanh'):
+        super().__init__()
         self.gen_type = 'LSTMd'
-        self.seq_dim = seq_dim # dimension of the time series e.g. how many stocks
+        self.seq_dim = seq_dim # dimension of the time series
         # self.noise_dim = noise_dim # dimension of the noise vector -> vector of (noise_dim, 1) concatenated with the seq value of dimension seq_dim at each time step
         self.seq_len = seq_len # length of the time series
         self.hidden_size = hidden_size
         self.n_lstm_layers = n_lstm_layers
+        self.max_pitch = max_pitch
 
         activation = getattr(nn, activation)
         self.rnn = nn.LSTM(input_size=seq_dim, hidden_size=hidden_size, num_layers=n_lstm_layers, batch_first=True, bidirectional=False)
@@ -105,48 +106,37 @@ class LSTMusic(nn.Module):
             activation(),
             nn.Linear(hidden_size*2, hidden_size),
             activation(),
-            nn.Linear(hidden_size, 1+129), # (1 exp rate for duration of note, 128+1 values for pitch and rest)
+            nn.Linear(hidden_size, 1+max_pitch+1), # (1 exp rate for duration of note, 128+1 values for pitch and rest)
         )
 
-    def _condition_lstm(self, hist_x):
+    def _generate_sequence(self, hist_x):
         batch_size = hist_x.shape[0] # noise shape: batch_size, seq_len, noise_dim
-        hist_len = hist_x.shape[1] # hist_x shape: batch_size, hist_len, seq_dim
+        hist_len = hist_x.shape[1]
+        device = hist_x.device
 
-        h = torch.zeros(self.n_lstm_layers, batch_size, self.hidden_size, requires_grad=False, device=noise.device)
-        c = torch.zeros(self.n_lstm_layers, batch_size, self.hidden_size, requires_grad=False, device=noise.device)
+        h = torch.zeros(self.n_lstm_layers, batch_size, self.hidden_size, requires_grad=False, device=device)
+        c = torch.zeros(self.n_lstm_layers, batch_size, self.hidden_size, requires_grad=False, device=device)
+        z, (h, c) = self.rnn(hist_x[:,:-1,:], (h, c))
+        x = hist_x[:,-1:,:] # (batch_size, 1, seq_dim)
         seq = []
-        if hist_x is not None: # feed in the historical data to get the hidden state
-            for i in range(hist_len):
-                x = hist_x[:,i:i+1,:]
-                _, (h, c) = self.rnn(x, (h, c))
-                seq.append(x)
-        return seq, h, c
-
-    def _generate_sequence(self, seq, h, c):
-        # print(self.seq_len, len(seq), dts.shape, noise.shape)
-        x = seq[-1] # (batch_size, 1, seq_dim)
-        for i in range(self.seq_len-len(seq)): # iterate over the remaining time steps
-            # print(x.shape, noise[:,i:i+1,:].shape, dt.shape)
-            z, (h, c) = self.rnn(x, (h, c))
-            z = self.output_net(z)
-            seq.append(x)
+        for _ in range(self.seq_len-hist_len): # iterate over the remaining time steps
+            z, (h, c) = self.rnn(x, (h, c)) # (batch_size, 1, hidden_size)
+            z = self.output_net(z) # (batch_size, 1, hidden) -> (batch_size, 1, 1+max_pitch+1)
 
             rate = z[:,0:1] # (batch_size, 1)
-            pitch = z[:,1:] # (batch_size, 129)
+            pitch = z[:,1:] # (batch_size, max_pitch+1)
 
-            duration = exponential.Exponential(torch.exp(start_rate))
-            end_dist = exponential.Exponential(torch.exp(end_rate))
+            dur_dist = exponential.Exponential(torch.exp(rate))
             pitch_dist = categorical.Categorical(logits=pitch)
-            velocity_dist = categorical.Categorical(logits=velocity)
 
-            start = start_dist.rsample() + last_start # (batch_size, 1)
-            end = end_dist.rsample() + start # (batch_size, 1)
-            pitch = pitch_dist.sample().unsqueeze(-1) / self.scale
-            velocity = velocity_dist.sample().unsqueeze(-1) / self.scale
+            duration = dur_dist.rsample() # (batch_size, 1)
+            pitch = pitch_dist.sample().unsqueeze(-1) # (batch_size, 1)
+
+            x = torch.cat([duration, pitch], dim=1).unsqueeze(1) #(batch_size, 1, 2)
+            seq.append(x)
+
         output_seq = torch.cat(seq, dim=1)
         return output_seq
 
-    def forward(self, noise, t, hist_x=None, abs_path=False, abs_returns=False):
-        x, noise, dts, h, c, seq = self._condition_lstm(noise, hist_x, t)
-        output_seq = self._generate_sequence(x, seq, noise, dts, h, c)
-        return self._return_output_seq(output_seq, None, abs_path, abs_returns)
+    def forward(self, hist_x=None):
+        return self._generate_sequence(hist_x)
