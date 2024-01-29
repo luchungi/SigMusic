@@ -127,6 +127,19 @@ def batch_lead_lag_transform(data: torch.Tensor, t:torch.Tensor, lead_lag: int|l
         lead_lag_data[:, lag+seq_len-1:, i*seq_dim:(i+1)*seq_dim] = data[:,-1:,:] # pad latter values with last value
     return torch.cat([t, lead_lag_data], axis=2)
 
+def batch_rectilinear_transform(data: torch.Tensor):
+    '''
+    Transform data to rectilinear format
+    Data is of shape (batch_size, seq_len, 2) where the last dimension is (duration, note) format
+    '''
+    batch_size = data.shape[0]
+    seq_len = data.shape[1]
+    t = torch.zeros((batch_size, seq_len+1), dtype=data.dtype, device=data.device, requires_grad=False)
+    t[:,1:] = torch.cumsum(data[:,:,0], dim=1) # shape (batch_size, seq_len)
+    t = torch.cat([t[:,0].unsqueeze(1), torch.repeat_interleave(t[:,1:-1], 2, dim=1), t[:,-1].unsqueeze(1)], dim=1)
+    tensor = torch.cat([t.unsqueeze(-1), torch.repeat_interleave(data[:,:,1:], 2, dim=1)], dim=-1)
+    return tensor
+
 def rectilinear_transform(df: pd.DataFrame, include_velocity: bool=False):
     rectilinear_path = []
     # gaps = df['Start'].iloc[1:].values - df['End'].iloc[:-1].values
@@ -141,6 +154,35 @@ def rectilinear_transform(df: pd.DataFrame, include_velocity: bool=False):
         rectilinear_path.append([row['Start']] + row[2:end_idx].values.tolist())
         rectilinear_path.append([row['End']] + row[2:end_idx].values.tolist())
     return np.array(rectilinear_path)
+
+def note_duration_transform(dfs: list[pd.DataFrame]):
+    '''
+    Transform df to have 2 cols: duration and pitch
+    0 is assumed to be reserved for rest with this transformation
+    '''
+    new_dfs = []
+    for df in dfs:
+        df = df.copy()
+        rows = []
+        df.loc[:, 'Pitch'] += 1 # add 1 to pitch to reserve 0 for rest
+        prev_end = None
+        for i, row in df.iterrows():
+            note = pd.Series({'Duration': row['End'] - row['Start'], 'Pitch': row['Pitch']})
+            if i == 0:
+                rows.append(note)
+                continue
+
+            # check if previous note ends before current note starts i.e. gap between notes
+            if prev_end is not None:
+                if prev_end < row['Start']:
+                    # add row with duration of gap with pitch 0 (rest)
+                    rows.append(pd.Series({'Duration': row['Start'] - prev_end, 'Pitch': 0}))
+                elif prev_end > row['Start']:
+                    raise ValueError('Overlapping notes')
+            prev_end = row['End']
+            rows.append(note)
+        new_dfs.append(pd.DataFrame(rows))
+    return new_dfs
 
 def get_dfs_from_midi(dir: str,
                       min_notes: int=1,
@@ -332,22 +374,24 @@ class MIDIDataset(Dataset):
             path[:,2:] = self.tensors[i][start:end, 2:] # get pitch and velocity columns
         return path
 
-class MelodyDataset(Dataset):
+class NoteDurationDataset(Dataset):
     '''
     Dataset for dataframes with MIDI data: 4 columns (start time, end time, pitch) in this order
     '''
     def __init__(self, dfs: list[pd.DataFrame], sample_len: int, scale: float=1., stride: int=1):
 
-        self.seq_dim = 3
+        self.seq_dim = 2
         self.scale = scale
         self.stride = stride
         self.sample_len = sample_len
         self.tensors = []
         self.lens = []
+        self.max_pitch = 1
         for df in dfs:
             if len(df) >= sample_len:
-                tensor = torch.tensor(df.iloc[:,:self.seq_dim].values, dtype=torch.float32, requires_grad=False)# (seq_len, seq_dim)
-                tensor[:,2:] = tensor[:,2:] / scale # scale pitch and velocity which are integers from 0 to 127
+                self.max_pitch = max(self.max_pitch, df['Pitch'].max())
+                tensor = torch.tensor(df.values, dtype=torch.float32, requires_grad=False)# (seq_len, seq_dim)
+                tensor[:,1:] = tensor[:,1:] / scale # pitch is an integer starting from 1 and ending at max pitch
                 self.tensors.append(tensor)
                 self.lens.append(int((tensor.shape[0] - self.sample_len)/self.stride) + 1)
         self.lens = np.cumsum(self.lens)
@@ -361,9 +405,7 @@ class MelodyDataset(Dataset):
         idx = idx if i == 0 else idx - self.lens[i-1] # get index relative to start of tensor
         start = idx*self.stride
         end = start + self.sample_len
-        path = torch.empty((self.sample_len, self.seq_dim), dtype=torch.float32, requires_grad=False) # shape (sample_len, seq_dim)
-        path[:,:2] = self.tensors[i][start:end, :2] - self.tensors[i][start, 0] # get start and end time columns and offset so that first start time is 0
-        path[:,2:] = self.tensors[i][start:end, 2:] # get pitch and velocity columns
+        path = self.tensors[i][start:end] # shape (sample_len, seq_dim)
         return path
 
 ##############################################################################################################
