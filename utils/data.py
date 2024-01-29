@@ -408,6 +408,23 @@ class NoteDurationDataset(Dataset):
         path = self.tensors[i][start:end] # shape (sample_len, seq_dim)
         return path
 
+def tensor_to_df(tensor: torch.Tensor, increment: int):
+    tensor = tensor.cpu().detach().numpy()
+    end = tensor[:,:,0].cumsum(axis=1)
+    start = np.zeros_like(end)
+    start[:,1:] = end[:,:-1]
+    velocity = 80 * np.ones_like(tensor[:,:,0])
+    pitch = tensor[:,:,1]
+    pitch[pitch > 0] += increment
+
+    dfs = []
+    for i in range(tensor.shape[0]):
+        df = pd.DataFrame({'Start': start[i], 'End': end[i], 'Pitch': pitch[i], 'Velocity': velocity[i]})
+        df = df[df['Pitch'] > 0]
+        dfs.append(df)
+
+    return dfs
+
 ##############################################################################################################
 # from https://github.com/annahung31/MidiNet-by-pytorch/blob/master/get_data.py
 
