@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.distributions import categorical, exponential
 
 class TransformerMusic(nn.Module):
-    def __init__(self, seq_dim:int, seq_len:int, hist_len:int, scale:float,
+    def __init__(self, seq_dim:int, seq_len:int, max_pitch: int, hist_len:int, scale:float,
                  kernel_size:int|list[int], stride:int|list[int], n_channels:int,
                  n_head:int, n_transformer_layers:int, hidden_size:int,
                  activation:str):
@@ -35,6 +35,7 @@ class TransformerMusic(nn.Module):
         self.n_transformer_layers = n_transformer_layers
         self.hidden_size = hidden_size
         self.scale = scale
+        self.max_pitch = max_pitch
         activation = getattr(nn, activation)
 
         self.encoded_seq_len = int((((hist_len) - kernel_size) / stride + 1))
@@ -48,7 +49,7 @@ class TransformerMusic(nn.Module):
             activation(),
             nn.Linear(hidden_size*2, hidden_size),
             activation(),
-            nn.Linear(hidden_size, 1+1+128+128), # (exp rate for start, exp rate for end, one hot categorical for pitch, one hot categorical for velocity)
+            nn.Linear(hidden_size, 1+self.max_pitch+1), # (exp rate for duration, max_pitch+1 values for pitch and rest)
         )
 
     def _generate_sequence(self, x): # (batch_size, sample_len, seq_dim))
@@ -56,27 +57,20 @@ class TransformerMusic(nn.Module):
         hist_x = x[:,:self.hist_len,:].permute(0,2,1) # (batch_size, seq_dim, hist_len)
 
         for _ in range(self.seq_len-self.hist_len):
-            last_start = hist_x[:,0:1,-1] # (batch_size, 1) assumes start is the first dimension
             z = self.encoder(hist_x).permute(0,2,1) # permute back to (batch_size, encoded_seq_len, n_channels)
             z = self.transformer_encoder(z) # (batch_size, encoded_seq_len, n_channels)
             z = self.decoder(z) # (batch_size, 1+1+128+128)
 
-            start_rate = z[:,0:1] # (batch_size, 1)
-            end_rate = z[:,1:2]
-            pitch = z[:,2:2+128] # (batch_size, 128)
-            velocity = z[:,2+128:]
+            rate = z[:,0:1] # (batch_size, 1)
+            pitch = z[:,1:] # (batch_size, max_pitch+1)
 
-            start_dist = exponential.Exponential(torch.exp(start_rate))
-            end_dist = exponential.Exponential(torch.exp(end_rate))
+            duration_dist = exponential.Exponential(torch.exp(rate))
             pitch_dist = categorical.Categorical(logits=pitch)
-            velocity_dist = categorical.Categorical(logits=velocity)
 
-            start = start_dist.rsample() + last_start # (batch_size, 1)
-            end = end_dist.rsample() + start # (batch_size, 1)
+            duration = duration_dist.rsample() # (batch_size, 1)
             pitch = pitch_dist.sample().unsqueeze(-1) / self.scale
-            velocity = velocity_dist.sample().unsqueeze(-1) / self.scale
 
-            note = torch.cat([start, end, pitch, velocity], dim=-1).unsqueeze(1) #(batch_size, 1, 4)
+            note = x = torch.cat([duration, pitch], dim=1).unsqueeze(1) #(batch_size, 1, 2)
             seq.append(note)
 
             hist_x = hist_x.roll(-1, dims=2)
@@ -86,6 +80,56 @@ class TransformerMusic(nn.Module):
 
     def forward(self, x):
         return self._generate_sequence(x)
+
+# class LSTMusic(nn.Module):
+#     def __init__(self, noise_dim: int, seq_dim: int, seq_len: int, max_pitch: int, hidden_size:int =64, n_lstm_layers: int=1, activation: str='Tanh'):
+#         super().__init__()
+#         self.gen_type = 'LSTMd'
+#         self.seq_dim = seq_dim # dimension of the time series
+#         self.noise_dim = noise_dim # dimension of the noise vector -> vector of (noise_dim, 1) concatenated with the seq value of dimension seq_dim at each time step
+#         self.seq_len = seq_len # length of the time series
+#         self.hidden_size = hidden_size
+#         self.n_lstm_layers = n_lstm_layers
+#         self.max_pitch = max_pitch
+
+#         activation = getattr(nn, activation)
+#         self.rnn = nn.LSTM(input_size=seq_dim+noise_dim, hidden_size=hidden_size, num_layers=n_lstm_layers, batch_first=True, bidirectional=False)
+#         self.output_net = nn.Sequential(
+#             nn.Flatten(),
+#             nn.Linear(hidden_size, hidden_size*2),
+#             activation(),
+#             nn.Linear(hidden_size*2, hidden_size),
+#             activation(),
+#             nn.Linear(hidden_size, 2), # (1 for note duration, 1 for pitch)
+#         )
+
+#     def _generate_sequence(self, noise, hist_x):
+#         batch_size = hist_x.shape[0] # noise shape: batch_size, seq_len, noise_dim
+#         hist_len = hist_x.shape[1]
+#         device = hist_x.device
+
+#         h = torch.zeros(self.n_lstm_layers, batch_size, self.hidden_size, requires_grad=False, device=device)
+#         c = torch.zeros(self.n_lstm_layers, batch_size, self.hidden_size, requires_grad=False, device=device)
+#         input = torch.cat([hist_x[:,:-1,:], noise[:,:hist_len-1,:]], dim=-1) # (batch_size, hist_len-1, seq_dim+noise_dim)
+#         z, (h, c) = self.rnn(input, (h, c))
+#         input = torch.cat([hist_x[:,-1:,:], noise[:,hist_len-1:hist_len,:]], dim=-1) # (batch_size, 1, seq_dim+noise_dim)
+#         seq = []
+#         for i in range(self.seq_len-hist_len): # iterate over the remaining time steps
+#             z, (h, c) = self.rnn(input, (h, c)) # (batch_size, 1, hidden_size)
+#             z = self.output_net(z) # (batch_size, 1, hidden) -> (batch_size, 2)
+
+#             duration = torch.sigmoid(z[:, 0:1]) # (batch_size, 1)
+#             pitch = torch.round(torch.sigmoid(z[:, 1:2]) * self.max_pitch) # (batch_size, 1)
+
+#             x = torch.cat([duration, pitch], dim=1).unsqueeze(1) #(batch_size, 1, 2)
+#             seq.append(x)
+#             input = torch.cat([x, noise[:,hist_len+i:hist_len+i+1,:]], dim=-1)
+
+#         output_seq = torch.cat(seq, dim=1)
+#         return output_seq
+
+#     def forward(self, noise, hist_x=None):
+#         return self._generate_sequence(noise, hist_x)
 
 class LSTMusic(nn.Module):
     def __init__(self, seq_dim: int, seq_len: int, max_pitch: int, hidden_size:int =64, n_lstm_layers: int=1, activation: str='Tanh'):
@@ -117,7 +161,7 @@ class LSTMusic(nn.Module):
         h = torch.zeros(self.n_lstm_layers, batch_size, self.hidden_size, requires_grad=False, device=device)
         c = torch.zeros(self.n_lstm_layers, batch_size, self.hidden_size, requires_grad=False, device=device)
         z, (h, c) = self.rnn(hist_x[:,:-1,:], (h, c))
-        x = hist_x[:,-1:,:] # (batch_size, 1, seq_dim)
+        x = hist_x[:,-1:,:] # (batch_size, hist_len-1, seq_dim)
         seq = []
         for _ in range(self.seq_len-hist_len): # iterate over the remaining time steps
             z, (h, c) = self.rnn(x, (h, c)) # (batch_size, 1, hidden_size)
@@ -130,6 +174,7 @@ class LSTMusic(nn.Module):
             pitch_dist = categorical.Categorical(logits=pitch)
 
             duration = dur_dist.rsample() # (batch_size, 1)
+            # duration = torch.sigmoid(rate)
             pitch = pitch_dist.sample().unsqueeze(-1) # (batch_size, 1)
 
             x = torch.cat([duration, pitch], dim=1).unsqueeze(1) #(batch_size, 1, 2)
