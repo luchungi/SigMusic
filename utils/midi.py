@@ -1,6 +1,8 @@
-import pretty_midi
+import os
+import shutil
+import numpy as np
 import pandas as pd
-import libfmp.c1
+import pretty_midi
 
 def midi_to_df(midi_data):
     midi_list = []
@@ -65,3 +67,90 @@ def midi_to_list(midi):
             velocity = note.velocity / 128.
             score.append([start, duration, pitch, velocity, instrument.name])
     return score
+
+def add_octave_and_note(df, midi_note_df, inplace=False):
+    '''
+    Find the octave and note of each pitch in df by matching it to the data in midi_note_df and add it to the dataframe
+    '''
+    df = df.copy() if not inplace else df
+    for i, row in df.iterrows():
+        octave = midi_note_df.index[midi_note_df[midi_note_df == int(row['Pitch'])].notna().sum(axis=1).astype(bool)]
+        if len(octave) > 1:
+            raise ValueError('More than one octave found')
+        else:
+            df.at[i, 'octave'] = octave[0]
+        note = midi_note_df.columns[midi_note_df[midi_note_df == int(row['Pitch'])].notna().sum(axis=0).astype(bool)]
+        if len(note) > 1:
+            raise ValueError('More than one note found')
+        else:
+            df.at[i, 'note'] = note[0]
+    if not inplace:
+        return df
+
+def get_key_note(key_number, tight=False):
+    if key_number < 0 or key_number > 23:
+        raise ValueError('Key number must be between 0 and 23.')
+    if tight:
+        notes = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+        scales = ['', 'm']
+    else:
+        notes = ['C', 'C#/Db', 'D', 'D#/Eb', 'E', 'F', 'F#/Gb', 'G', 'G#/Ab', 'A', 'A#/Bb', 'B']
+        scales = ['major', 'minor']
+    note = notes[key_number % 12]
+    scale = scales[key_number // 12]
+    if tight:
+        return f'{note}{scale}'
+    else:
+        return f'{note} {scale}'
+
+def copy_to_single_key(entry, key_number):
+    path = entry.path.split('/')
+    if len(path) != 8:
+        raise ValueError('Path does not conform to expected format (length).')
+    new_path = f'./data/single_key/{key_number}/{path[4]}/{path[5]}/{path[6]}/{path[7]}'
+    if not os.path.exists(f'./data/single_key/{key_number}/{path[4]}/{path[5]}/{path[6]}/'):
+        os.makedirs(f'./data/single_key/{key_number}/{path[4]}/{path[5]}/{path[6]}/')
+    # print(new_path)
+    shutil.copy(entry.path, new_path)
+
+def copy_to_multiple_keys(entry):
+    path = entry.path.split('/')
+    if len(path) != 8:
+        raise ValueError('Path does not conform to expected format (length).')
+    new_path = f'./data/multiple_keys/{path[4]}/{path[5]}/{path[6]}/{path[7]}'
+    if not os.path.exists(f'./data/multiple_keys/{path[4]}/{path[5]}/{path[6]}/'):
+        os.makedirs(f'./data/multiple_keys/{path[4]}/{path[5]}/{path[6]}/')
+    # print(new_path)
+    shutil.copy(entry.path, new_path)
+
+def no_key_change_in_song(keys):
+    return keys.count(keys[0]) == len(keys)
+
+def get_key_and_sort_files_to_dir(directory: str, key_counts: np.ndarray, n_midi_files: int=0):
+    if n_midi_files > 0: # multiple midi files for same song
+        files = []
+        keys = []
+        for entry in os.scandir(directory):
+            if entry.is_file() and entry.name.endswith('.mid'):
+                files.append(entry)
+                midi_data = pretty_midi.PrettyMIDI(entry.path)
+                key_signature = midi_data.key_signature_changes
+                if len(key_signature) > 1:
+                    raise ValueError(f'More than one key signature change in midi file {entry.path}')
+                keys.append(int(key_signature[0].key_number))
+        if no_key_change_in_song(keys):
+            # print(f'{directory.split("/")[6]} written in {get_key_note(keys[0])} key')
+            key_counts[keys[0]] += 1
+            for file in files:
+                copy_to_single_key(file, keys[0])
+        else:
+            # unique_keys = set(keys)
+            # key_notes = [get_key_note(key) for key in unique_keys]
+            # print(f'{directory.split("/")[6]} written in {len(unique_keys)} keys: {key_notes}')
+            for file in files:
+                copy_to_multiple_keys(file)
+    else:
+        for entry in os.scandir(directory):
+            if entry.is_dir():
+                n_midi_files = len([name for name in os.listdir(entry.path) if name.endswith('.mid')])
+                get_key_and_sort_files_to_dir(entry.path, key_counts, n_midi_files)
