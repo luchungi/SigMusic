@@ -63,10 +63,10 @@ def signature_kern_first_order(M : torch.Tensor, n_levels : int, difference : bo
 
     if M.ndim == 4:
         n_X, n_Y = M.shape[0], M.shape[2]
-        K = torch.ones((n_X, n_Y), dtype=M.dtype)
+        K = torch.ones((n_X, n_Y), dtype=M.dtype, device=M.device)
     else:
         n_X = M.shape[0]
-        K = torch.ones((n_X,), dtype=M.dtype)
+        K = torch.ones((n_X,), dtype=M.dtype, device=M.device)
 
     if return_levels:
         K = [K, torch.sum(M, dim=(1, -1))]
@@ -103,7 +103,7 @@ def signature_kern_higher_order(M : torch.Tensor, n_levels : int, order : int, d
     device = M.device
     if device_ids:
         if difference:
-            M = torch.diff(torch.diff(M, dim=1), dim=-1) # computes d(i,j)(k(x,y)) = k(x(i+1),y(j+1)) + k(x(i),y(j)) - k(x(i+1),y(j)) - k(x(i),y(j+1))
+            M = torch.diff(torch.diff(M, dim=1), dim=-1) # M[i,j,k,l] = k(X[i,j+1], Y[k,l+1]) - k(X[i,j], Y[k,l+1]) - k(X[i,j+1], Y[k,l]) + k(X[i,j], Y[k,l])
         else:
             M = M
         ndim = M.ndim
@@ -156,7 +156,7 @@ def signature_kern_higher_order(M : torch.Tensor, n_levels : int, order : int, d
                 K += R.sum(dim=(0, 1, 3, -1)).recombine(out_device=device)
     else:
         if difference:
-            M = torch.diff(torch.diff(M, dim=1), dim=-1) # computes d(i,j)(k(x,y)) = k(x(i+1),y(j+1)) + k(x(i),y(j)) - k(x(i+1),y(j)) - k(x(i),y(j+1))
+            M = torch.diff(torch.diff(M, dim=1), dim=-1) # M[i,j,k,l] = k(X[i,j+1], Y[k,l+1]) - k(X[i,j], Y[k,l+1]) - k(X[i,j+1], Y[k,l]) + k(X[i,j], Y[k,l])
 
         if M.ndim == 4:
             n_X, n_Y = M.shape[0], M.shape[2]
