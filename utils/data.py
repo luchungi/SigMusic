@@ -317,18 +317,23 @@ def batch_rectilinear_with_gap_transform(data: torch.Tensor):
     '''
     Transform data to rectilinear format
     Data is of shape (batch_size, seq_len, 3) where the last dimension is (gap, duration, note) format
+    When there is a rest, there in a gap between notes which results is non-vertical lines in the rectilinear plot
+    e.g. if note goes from (start=0.5, end=0.7, pitch=2) to (start=0.9, end=1.1. pitch=3)
+    then there is a horizontal line from (0.5, 2) to (0.7, 2) and a straight line from (0.7, 2) to (0.9, 3)
     '''
     assert data.ndim == 3, 'data must be of shape (batch_size, seq_len, 3)'
     assert data.shape[2] == 3, 'data must be of shape (batch_size, seq_len, 3)'
     batch_size = data.shape[0]
     seq_len = data.shape[1]
-    t = torch.zeros((batch_size, seq_len+1), dtype=data.dtype, device=data.device, requires_grad=False)
-    t[:,1:] = torch.cumsum(data[:,:,1], dim=1) # shape (batch_size, seq_len)
-    t[:,:-1] = t[:,:-1] + data[:,:,0] # add gap to time sequence to get correct start time
-    t = torch.cat([t[:,0].unsqueeze(1), torch.repeat_interleave(t[:,1:-1], 2, dim=1), t[:,-1].unsqueeze(1)], dim=1)
-    print(t.shape)
-    pitch = data[:,:,2:].cumsum(dim=1) # shape (batch_size, seq_len, 1)
-    tensor = torch.cat([t.unsqueeze(-1), torch.repeat_interleave(pitch, 2, dim=1)], dim=-1)
+    gap_cumsum = data[:,:,0].cumsum(dim=1) # shape (batch_size, seq_len)
+    dur_cumsum = data[:,:,1].cumsum(dim=1) # shape (batch_size, seq_len)
+    starts = torch.zeros_like(dur_cumsum) # shape (batch_size, seq_len)
+    starts[:,1:] += dur_cumsum[:,:-1]
+    starts += gap_cumsum
+    ends = dur_cumsum + gap_cumsum
+    t = torch.stack([starts, ends], dim=2).view(batch_size, seq_len*2).unsqueeze(-1) # shape (batch_size, seq_len*2, 1)
+    pitch = data[:,:,-1:].cumsum(dim=1) # shape (batch_size, seq_len, 1
+    tensor = torch.cat([t, torch.repeat_interleave(pitch, 2, dim=1)], dim=-1)
     return tensor
 
 def rectilinear_transform(df: pd.DataFrame, include_velocity: bool=False):
@@ -378,6 +383,8 @@ def note_duration_transform(dfs: list[pd.DataFrame]):
 def gap_duration_deltapitch_transform(dfs: list[pd.DataFrame]):
     '''
     Transform df to have 3 cols: gap to next note, duration of note and change in pitch from previous note
+    First delta pitch is defaulted to 0 so that the first note is determined by the user
+    In other words, the user sets the first note which also determines the key of the song
     Gap between notes is assumed to be rest
     This format is used for increment based models
     '''
