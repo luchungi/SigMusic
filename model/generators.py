@@ -81,56 +81,6 @@ class TransformerMusic(nn.Module):
     def forward(self, x):
         return self._generate_sequence(x)
 
-# class LSTMusic(nn.Module):
-#     def __init__(self, noise_dim: int, seq_dim: int, seq_len: int, max_pitch: int, hidden_size:int =64, n_lstm_layers: int=1, activation: str='Tanh'):
-#         super().__init__()
-#         self.gen_type = 'LSTMd'
-#         self.seq_dim = seq_dim # dimension of the time series
-#         self.noise_dim = noise_dim # dimension of the noise vector -> vector of (noise_dim, 1) concatenated with the seq value of dimension seq_dim at each time step
-#         self.seq_len = seq_len # length of the time series
-#         self.hidden_size = hidden_size
-#         self.n_lstm_layers = n_lstm_layers
-#         self.max_pitch = max_pitch
-
-#         activation = getattr(nn, activation)
-#         self.rnn = nn.LSTM(input_size=seq_dim+noise_dim, hidden_size=hidden_size, num_layers=n_lstm_layers, batch_first=True, bidirectional=False)
-#         self.output_net = nn.Sequential(
-#             nn.Flatten(),
-#             nn.Linear(hidden_size, hidden_size*2),
-#             activation(),
-#             nn.Linear(hidden_size*2, hidden_size),
-#             activation(),
-#             nn.Linear(hidden_size, 2), # (1 for note duration, 1 for pitch)
-#         )
-
-#     def _generate_sequence(self, noise, hist_x):
-#         batch_size = hist_x.shape[0] # noise shape: batch_size, seq_len, noise_dim
-#         hist_len = hist_x.shape[1]
-#         device = hist_x.device
-
-#         h = torch.zeros(self.n_lstm_layers, batch_size, self.hidden_size, requires_grad=False, device=device)
-#         c = torch.zeros(self.n_lstm_layers, batch_size, self.hidden_size, requires_grad=False, device=device)
-#         input = torch.cat([hist_x[:,:-1,:], noise[:,:hist_len-1,:]], dim=-1) # (batch_size, hist_len-1, seq_dim+noise_dim)
-#         z, (h, c) = self.rnn(input, (h, c))
-#         input = torch.cat([hist_x[:,-1:,:], noise[:,hist_len-1:hist_len,:]], dim=-1) # (batch_size, 1, seq_dim+noise_dim)
-#         seq = []
-#         for i in range(self.seq_len-hist_len): # iterate over the remaining time steps
-#             z, (h, c) = self.rnn(input, (h, c)) # (batch_size, 1, hidden_size)
-#             z = self.output_net(z) # (batch_size, 1, hidden) -> (batch_size, 2)
-
-#             duration = torch.sigmoid(z[:, 0:1]) # (batch_size, 1)
-#             pitch = torch.round(torch.sigmoid(z[:, 1:2]) * self.max_pitch) # (batch_size, 1)
-
-#             x = torch.cat([duration, pitch], dim=1).unsqueeze(1) #(batch_size, 1, 2)
-#             seq.append(x)
-#             input = torch.cat([x, noise[:,hist_len+i:hist_len+i+1,:]], dim=-1)
-
-#         output_seq = torch.cat(seq, dim=1)
-#         return output_seq
-
-#     def forward(self, noise, hist_x=None):
-#         return self._generate_sequence(noise, hist_x)
-
 class LSTMusic(nn.Module):
     def __init__(self, seq_dim: int, seq_len: int, max_pitch: int, hidden_size:int =64, n_lstm_layers: int=1, activation: str='Tanh'):
         super().__init__()
@@ -187,19 +137,33 @@ class LSTMusic(nn.Module):
         return self._generate_sequence(hist_x)
 
 class LSTMinc(nn.Module):
-    def __init__(self, noise_dim:int, seq_dim: int, seq_len: int, hidden_size:int =64, n_lstm_layers: int=1, activation: str='Tanh'):
+    '''
+    LSTM model that generates a sequence of delta pitch values
+    The output of the LSTM is passed through a linear layer followed by a tanh activation to ensure that the delta pitch values are within the range [-1, 1]
+    This value is then multiplied by the dpitch_range (input) to get the actual delta pitch value
+    The gap and pitch duration are given as input from the reference sample
+    Previous solution tried to generate these values by taking the exponential of the output of the LSTM
+    However, the gap ended getting too large towards the end of the sequence
+    '''
+
+    def __init__(self, noise_dim:int, seq_dim: int, seq_len: int, hidden_size:int =64, n_lstm_layers: int=1, activation: str='Tanh', dpitch_range: int=24):
         super().__init__()
         self.gen_type = 'LSTMd'
         self.seq_dim = seq_dim # dimension of the time series
-        # self.noise_dim = noise_dim # dimension of the noise vector -> vector of (noise_dim, 1) concatenated with the seq value of dimension seq_dim at each time step
+        self.noise_dim = noise_dim # dimension of the noise vector -> vector of (noise_dim, 1) concatenated with the seq value of dimension seq_dim at each time step
         self.seq_len = seq_len # length of the time series
         self.hidden_size = hidden_size
         self.n_lstm_layers = n_lstm_layers
+        self.dpitch_range = dpitch_range
 
         activation = getattr(nn, activation)
         self.rnn = nn.LSTM(input_size=noise_dim + seq_dim, hidden_size=hidden_size, num_layers=n_lstm_layers, batch_first=True, bidirectional=False)
+        # self.output_net = nn.Sequential(
+        #     nn.Linear(hidden_size, 27), # 1st value as gap duration, 2nd as pitch duration and the next 25 values as logits for delta pitch distribution
+        # )
         self.output_net = nn.Sequential(
-            nn.Linear(hidden_size, 3), # (1 for duration to pause before starting note, 1 for note duration, 1 for pitch)
+            nn.Linear(hidden_size, 1), # 25 values as logits for delta pitch distribution
+            nn.Tanh()
         )
 
     def _condition_lstm(self, noise, hist_x):
@@ -209,34 +173,29 @@ class LSTMinc(nn.Module):
 
         if hist_x is not None: # feed in the historical data to get the hidden state
             input = torch.cat([hist_x, noise[:, :hist_x.shape[1], :]], dim=-1)
-
             output, (h, c) = self.rnn(input, (h, c))
             noise = noise[:,hist_x.shape[1]:,:] # set the noise to start from the end of the historical data
         else:
             output = torch.zeros(batch_size, 1, self.hidden_size, requires_grad=False, device=noise.device)
         return output[:,-1:,:], noise, h, c
 
-    def _generate_sequence(self, output, noise, h, c):
+    def _generate_sequence(self, output, noise, h, c, gap_duration):
         gen_seq = []
         for i in range(noise.shape[1]+1): # +1 for the first note which is using the output passed in
-            x = self.output_net(output)
-            x[:,:,:2] = torch.nn.ReLU()(x[:,:,:2]) # ensure that the duration and pause duration are positive
-            x[:,:,2:] = torch.round(x[:,:,2:]) # round the delta pitch to the nearest integer
+            z = self.output_net(output)
+            # gap_duration = torch.exp(z[:,:,:2]) # ensure that the duration and pause duration are positive
+            deltapitch = z * self.dpitch_range
+            x = torch.cat([gap_duration[:,i:i+1,:], deltapitch], dim=-1)
             gen_seq.append(x)
             if i < noise.shape[1]:
                 input = torch.cat([x, noise[:,i:i+1,:]], dim=-1) # len=1, batch_size, input_size=X.shape[-1]+noise_dim+1 for dt
                 output, (h, c) = self.rnn(input, (h, c))
-        # print(f'Historical sequence shape: {seq.shape}')
-        # print(seq)
         output_seq = torch.cat(gen_seq, dim=1)
-        # print(f'Generated sequence shape: {output_seq.shape}')
-        # print(output_seq)
         return output_seq
 
-    def forward(self, noise, hist_x=None):
+    def forward(self, noise, hist_x=None, gap_duration=None):
         output, noise, h, c = self._condition_lstm(noise, hist_x)
-        output_seq = self._generate_sequence(output, noise, h, c)
-        # print(output_seq.shape)
+        output_seq = self._generate_sequence(output, noise, h, c, gap_duration)
         if hist_x is None:
             return output_seq
         else:

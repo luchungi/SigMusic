@@ -336,6 +336,33 @@ def batch_rectilinear_with_gap_transform(data: torch.Tensor):
     tensor = torch.cat([t, torch.repeat_interleave(pitch, 2, dim=1)], dim=-1)
     return tensor
 
+def batch_gap_duration_pitch_to_df(data: torch.Tensor, start_pitch=60, velocity=80):
+    '''
+    Transform data to rectilinear format
+    Data is of shape (batch_size, seq_len, 3) where the last dimension is (gap, duration, note) format
+    When there is a rest, there in a gap between notes which results is non-vertical lines in the rectilinear plot
+    e.g. if note goes from (start=0.5, end=0.7, pitch=2) to (start=0.9, end=1.1. pitch=3)
+    then there is a horizontal line from (0.5, 2) to (0.7, 2) and a straight line from (0.7, 2) to (0.9, 3)
+    '''
+    assert data.ndim == 3, 'data must be of shape (batch_size, seq_len, 3)'
+    assert data.shape[2] == 3, 'data must be of shape (batch_size, seq_len, 3)'
+    batch_size = data.shape[0]
+    seq_len = data.shape[1]
+    gap_cumsum = data[:,:,0].cumsum(dim=1) # shape (batch_size, seq_len)
+    dur_cumsum = data[:,:,1].cumsum(dim=1) # shape (batch_size, seq_len)
+    starts = torch.zeros_like(dur_cumsum) # shape (batch_size, seq_len)
+    starts[:,1:] += dur_cumsum[:,:-1]
+    starts += gap_cumsum
+    ends = dur_cumsum + gap_cumsum
+    pitch = torch.round(data[:,:,-1:]).cumsum(dim=1) + start_pitch # shape (batch_size, seq_len, 1
+    velocity = torch.ones_like(pitch) * velocity
+    tensor = torch.cat([starts.unsqueeze(-1), ends.unsqueeze(-1), pitch, velocity], dim=-1)
+    dfs = []
+    for i in range(batch_size):
+        df = pd.DataFrame(tensor[i].cpu().detach().numpy(), columns=['Start', 'End', 'Pitch', 'Velocity'])
+        dfs.append(df)
+    return dfs
+
 def rectilinear_transform(df: pd.DataFrame, include_velocity: bool=False):
     rectilinear_path = []
     # gaps = df['Start'].iloc[1:].values - df['End'].iloc[:-1].values
@@ -555,6 +582,7 @@ def pitch_translation(dfs: list[pd.DataFrame]):
     for df in dfs:
         df.loc[df['Pitch'] > 0, 'Pitch'] -= (min_pitch - 1) # subtract min_pitch and add 1 to reserve 0 for rest
     return dfs, max_pitch - min_pitch + 1
+
 class MIDIDataset(Dataset):
     '''
     Dataset for dataframes with MIDI data: 5 columns (start time, end time, pitch, velocity, instrument) in this order
@@ -602,6 +630,7 @@ class MIDIDataset(Dataset):
             path[:,:2] = self.tensors[i][start:end,:2] - self.tensors[i][start, 0] # get start and end time columns and offset so that first start time is 0
             path[:,2:] = self.tensors[i][start:end, 2:] # get pitch and velocity columns
         return path
+
 class NoteDurationDataset(Dataset):
     '''
     Dataset for dataframes with MIDI data: 2 columns (Duration, Pitch) in this order
@@ -637,6 +666,7 @@ class NoteDurationDataset(Dataset):
         end = start + self.sample_len
         path = self.tensors[i][start:end] # shape (sample_len, seq_dim)
         return path
+
 class GapDurationDeltaPitchDataset(Dataset):
     '''
     Dataset for dataframes with MIDI data: 3 columns (start time, end time, pitch) in this order
