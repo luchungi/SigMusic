@@ -40,8 +40,8 @@ def df_to_midi(df, instrument_name=None):
     for _, row in df.iterrows():
         start = row['Start']
         end = row['End']
-        pitch = row['Pitch']
-        velocity = row['Velocity']
+        pitch = int(row['Pitch'])
+        velocity = int(row['Velocity'])
         note = pretty_midi.Note(velocity=velocity, pitch=pitch, start=start, end=end)
         instrument.notes.append(note)
     midi_data.instruments.append(instrument)
@@ -77,6 +77,21 @@ def midi_to_list(midi):
             velocity = note.velocity / 128.
             score.append([start, duration, pitch, velocity, instrument.name])
     return score
+
+def get_notes_from_major_scale(scale):
+    '''
+    Get all notes in a major scale
+    0 = C, 1 = C#, 2 = D, ...
+    '''
+    assert scale >= 0, 'Scale must be greater than or equal to 0'
+    assert scale < 12, 'Scale must be less than 12'
+    major_scale = [0, 2, 4, 5, 7, 9, 11]
+    np_major_scale = np.array(major_scale) + scale
+    if scale > 0:
+        major_scale = list(np_major_scale + scale)
+    for i in range(12,97,12):
+        major_scale += list(np_major_scale + i)
+    return major_scale
 
 def add_octave_and_note(df, midi_note_df, inplace=False):
     '''
@@ -413,6 +428,8 @@ def gap_duration_deltapitch_transform(dfs: list[pd.DataFrame]):
     First delta pitch is defaulted to 0 so that the first note is determined by the user
     In other words, the user sets the first note which also determines the key of the song
     Gap between notes is assumed to be rest
+    The gap represents the time between the end of the previous note and the start of the current note
+    First gap is defaulted to 0 so that the first note is played immediately
     This format is used for increment based models
     '''
     new_dfs = []
@@ -446,7 +463,8 @@ def get_dfs_from_midi(dir: str,
                       min_gap: float=0,
                       note_dur_transform: bool=False):
     '''
-    Get dataframes from midi files in dir
+    Get dataframes from midi files in dir amd convert to dataframes
+    Provide artist and song name in a list as a tuple in the format (artist, song)
     Filter out midi files where number of notes is less than min_notes (length of df)
     Filter out midi files where minimum gap between notes is less than min_gap (overlapping notes if negative)
     Transform dataframes to have 2 cols: duration and pitch if note_dur_transform is True
@@ -457,6 +475,11 @@ def get_dfs_from_midi(dir: str,
         if entry.is_dir():
             dfs.extend(get_dfs_from_midi(entry.path, min_notes, min_gap, note_dur_transform))
         elif entry.is_file() and (entry.name.endswith('.midi') or entry.name.endswith('.mid')):
+            path = entry.path
+            split_path = path.split('/')
+            type = split_path[-1]
+            song = split_path[-2]
+            artist = split_path[-3]
             midi_data = pretty_midi.PrettyMIDI(entry.path)
             df = midi_to_df(midi_data)
 
@@ -488,18 +511,19 @@ def get_dfs_from_midi(dir: str,
             # filter out midi files where number of notes is less than min_notes
             if len(df) < min_notes: continue
 
-            dfs.append(df) # only append if midi file contains notes
+            dfs.append((df, artist, song, type)) # only append if midi file contains notes
     return dfs
 
-def trim_by_range(dfs: list[pd.DataFrame], min_range: int, max_range: int, exclude_rest: bool=False):
+def trim_by_range(dfs: list[Tuple], min_range: int, max_range: int, exclude_rest: bool=False):
     '''
     Trim dataframes to have max_range pitch range
     '''
     new_dfs = []
-    for df in dfs:
+    for item in dfs:
+        df = item[0]
         range_of_pitch = df.loc[df['Pitch'] > 0, 'Pitch'].max() - df.loc[df['Pitch'] > 0, 'Pitch'].min() if exclude_rest else df['Pitch'].max() - df['Pitch'].min()
         if range_of_pitch >= min_range and range_of_pitch <= max_range:
-            new_dfs.append(df.copy())
+            new_dfs.append((df.copy(), item[1], item[2], item[3]))
     return new_dfs
 
 def move_octaves(dfs: list[pd.DataFrame],
@@ -669,12 +693,23 @@ class NoteDurationDataset(Dataset):
 
 class GapDurationDeltaPitchDataset(Dataset):
     '''
-    Dataset for dataframes with MIDI data: 3 columns (start time, end time, pitch) in this order
+    Dataset for dataframes with 3 columns (Gap, Duration, DeltaPitch) in this order
+    Output consists of a tensor for the 3 columns, a tuple for the artist and song name and the type of data (verse, chorus, etc.)
+    If cluster is provided, then an additional output for the cluster is included
+    Each sample is of the same length that is determined by sample_len
+    Gap is the time between the end of the previous note and the start of the current note
+    First gap is defaulted to 0 so that the first note is played immediately
+    Duration is the time the note is played for
+    DeltaPitch is the change in pitch from the previous note
+    First delta pitch is defaulted to 0 so that the first note is determined by the user
+    In other words, the user sets the first note which also determines the key of the song
+    When sampling from the middle of a song, the initial DeltaPitch and Gap are not gaurenteed to be 0 (To Do: fix this or use stride > max_length of songs)
     '''
-    def __init__(self, dfs: list[pd.DataFrame], sample_len: int, scale: float=1., stride: int=1):
+    def __init__(self, dfs: list[pd.DataFrame], sample_len: int, scale: float=1., stride: int=1, clusters: Optional[list]=None):
 
-        assert dfs[0].columns.tolist() == ['Gap', 'Duration', 'DeltaPitch'], 'Columns must be in order: Start, End, Pitch'
+        assert dfs[0].columns.tolist() == ['Gap', 'Duration', 'DeltaPitch'], 'Columns must be in order: Gap, Duration, DeltaPitch'
 
+        self.clusters = torch.tensor(clusters, dtype=torch.float32, requires_grad=False) if clusters is not None else None
         self.seq_dim = 3
         self.scale = scale
         self.stride = stride
@@ -698,8 +733,42 @@ class GapDurationDeltaPitchDataset(Dataset):
         idx = idx if i == 0 else idx - self.lens[i-1] # get index relative to start of tensor
         start = idx*self.stride
         end = start + self.sample_len
-        path = self.tensors[i][start:end] # shape (sample_len, seq_dim)
-        return path
+        path = self.tensors[i][start:end] # shape (sample_len, seq_dim) # TODO: fix the non-zero initial values when sampling from the middle of a song
+        if self.clusters is None:
+            return path, torch.tensor(i, dtype=torch.int16, requires_grad=False)
+        else:
+            return path, torch.tensor(i, dtype=torch.int16, requires_grad=False), self.clusters[i]
+
+class GapDurDpitchFullLenDataset(Dataset):
+    '''
+    Dataset for dataframes with 3 columns (Gap, Duration, DeltaPitch) in this order
+    Each sample uses the full length of the song
+    Gap is the time between the end of the previous note and the start of the current note
+    First gap is defaulted to 0 so that the first note is played immediately
+    Duration is the time the note is played for
+    DeltaPitch is the change in pitch from the previous note
+    First delta pitch is defaulted to 0 so that the first note is determined by the user
+    In other words, the user sets the first note which also determines the key of the song
+    When sampling from the middle of a song, the initial DeltaPitch and Gap are not gaurenteed to be 0 (To Do: fix this or use stride > max_length of songs)
+    '''
+    def __init__(self, dfs: list[pd.DataFrame], scale: float=1.):
+
+        assert dfs[0].columns.tolist() == ['Gap', 'Duration', 'DeltaPitch'], 'Columns must be in order: Gap, Duration, DeltaPitch'
+
+        self.seq_dim = 3
+        self.scale = scale
+        self.tensors = []
+        self.lens = []
+        for df in dfs:
+            tensor = torch.tensor(df.values, dtype=torch.float32, requires_grad=False)# (seq_len, seq_dim)
+            tensor[:,-1] = tensor[:,-1] / scale # scale pitch values accordingly
+            self.tensors.append(tensor)
+
+    def __len__(self):
+        return len(self.tensors)
+
+    def __getitem__(self, idx):
+        return self.tensors[idx]
 
 def tensor_to_df(tensor: torch.Tensor, increment: int):
     tensor = tensor.cpu().detach().numpy()
