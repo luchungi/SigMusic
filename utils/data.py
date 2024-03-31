@@ -29,6 +29,80 @@ def midi_to_df(midi_data):
     df = pd.DataFrame(midi_list, columns=['Start', 'End', 'Pitch', 'Velocity', 'Instrument'])
     return df
 
+def get_key_signature(midi_data):
+    keys = []
+    for key in midi_data.key_signature_changes:
+        keys.append((key.key_number, key.time))
+    return keys
+
+def get_time_signature(midi_data):
+    measures = []
+    for time_signature in midi_data.time_signature_changes:
+        measures.append((time_signature.numerator, time_signature.denominator, time_signature.time))
+    return measures
+
+def get_beat_duration(midi_data):
+    return midi_data.get_beats()
+
+def get_dfs_from_midi(dir: str,
+                      min_notes: int=1,
+                      min_gap: float=0,
+                      note_dur_transform: bool=False):
+    '''
+    Get dataframes from midi files in dir amd convert to dataframes
+    Provide artist and song name in a list as a tuple in the format (artist, song)
+    Filter out midi files where number of notes is less than min_notes (length of df)
+    Filter out midi files where minimum gap between notes is less than min_gap (overlapping notes if negative)
+    Transform dataframes to have 2 cols: duration and pitch if note_dur_transform is True
+    0 is assumed to be reserved for rest with this transformation
+    '''
+    dfs = []
+    for entry in os.scandir(dir):
+        if entry.is_dir():
+            dfs.extend(get_dfs_from_midi(entry.path, min_notes, min_gap, note_dur_transform))
+        elif entry.is_file() and (entry.name.endswith('.midi') or entry.name.endswith('.mid')):
+            path = entry.path
+            split_path = path.split('/')
+            type = split_path[-1]
+            song = split_path[-2]
+            artist = split_path[-3]
+            midi_data = pretty_midi.PrettyMIDI(entry.path)
+            keys = get_key_signature(midi_data)
+            measures = get_time_signature(midi_data)
+            beats = get_beat_duration(midi_data)
+            df = midi_to_df(midi_data)
+
+            # filter out midi files where gap between notes is less than min_gap
+            gap = df['Start'].iloc[1:].values - df['End'].iloc[:-1].values
+            if len(gap) ==0 or gap.min() < min_gap: continue
+
+            if note_dur_transform:
+                rows = []
+                df.loc[:, 'Pitch'] += 1 # add 1 to pitch to reserve 0 for rest
+                prev_end = None
+                for i, row in df.iterrows():
+                    note = pd.Series({'Duration': row['End'] - row['Start'], 'Pitch': row['Pitch']})
+                    if i == 0:
+                        rows.append(note)
+                        continue
+
+                    # check if previous note ends before current note starts i.e. gap between notes
+                    if prev_end is not None:
+                        if prev_end < row['Start']:
+                            # add row with duration of gap with pitch 0 (rest)
+                            rows.append(pd.Series({'Duration': row['Start'] - prev_end, 'Pitch': 0}))
+                        elif prev_end > row['Start']:
+                            raise ValueError('Overlapping notes')
+                    prev_end = row['End']
+                    rows.append(note)
+                df = pd.DataFrame(rows)
+
+            # filter out midi files where number of notes is less than min_notes
+            if len(df) < min_notes: continue
+
+            dfs.append((df, artist, song, type, keys, measures, beats)) # only append if midi file contains notes
+    return dfs
+
 def df_to_midi(df, instrument_name=None):
     midi_data = pretty_midi.PrettyMIDI()
     if instrument_name is None:
@@ -458,62 +532,6 @@ def gap_duration_deltapitch_transform(dfs: list[pd.DataFrame]):
 
     return new_dfs
 
-def get_dfs_from_midi(dir: str,
-                      min_notes: int=1,
-                      min_gap: float=0,
-                      note_dur_transform: bool=False):
-    '''
-    Get dataframes from midi files in dir amd convert to dataframes
-    Provide artist and song name in a list as a tuple in the format (artist, song)
-    Filter out midi files where number of notes is less than min_notes (length of df)
-    Filter out midi files where minimum gap between notes is less than min_gap (overlapping notes if negative)
-    Transform dataframes to have 2 cols: duration and pitch if note_dur_transform is True
-    0 is assumed to be reserved for rest with this transformation
-    '''
-    dfs = []
-    for entry in os.scandir(dir):
-        if entry.is_dir():
-            dfs.extend(get_dfs_from_midi(entry.path, min_notes, min_gap, note_dur_transform))
-        elif entry.is_file() and (entry.name.endswith('.midi') or entry.name.endswith('.mid')):
-            path = entry.path
-            split_path = path.split('/')
-            type = split_path[-1]
-            song = split_path[-2]
-            artist = split_path[-3]
-            midi_data = pretty_midi.PrettyMIDI(entry.path)
-            df = midi_to_df(midi_data)
-
-            # filter out midi files where gap between notes is less than min_gap
-            gap = df['Start'].iloc[1:].values - df['End'].iloc[:-1].values
-            if len(gap) ==0 or gap.min() < min_gap: continue
-
-            if note_dur_transform:
-                rows = []
-                df.loc[:, 'Pitch'] += 1 # add 1 to pitch to reserve 0 for rest
-                prev_end = None
-                for i, row in df.iterrows():
-                    note = pd.Series({'Duration': row['End'] - row['Start'], 'Pitch': row['Pitch']})
-                    if i == 0:
-                        rows.append(note)
-                        continue
-
-                    # check if previous note ends before current note starts i.e. gap between notes
-                    if prev_end is not None:
-                        if prev_end < row['Start']:
-                            # add row with duration of gap with pitch 0 (rest)
-                            rows.append(pd.Series({'Duration': row['Start'] - prev_end, 'Pitch': 0}))
-                        elif prev_end > row['Start']:
-                            raise ValueError('Overlapping notes')
-                    prev_end = row['End']
-                    rows.append(note)
-                df = pd.DataFrame(rows)
-
-            # filter out midi files where number of notes is less than min_notes
-            if len(df) < min_notes: continue
-
-            dfs.append((df, artist, song, type)) # only append if midi file contains notes
-    return dfs
-
 def trim_by_range(dfs: list[Tuple], min_range: int, max_range: int, exclude_rest: bool=False):
     '''
     Trim dataframes to have max_range pitch range
@@ -629,10 +647,10 @@ class MIDIDataset(Dataset):
                 if rectilinear:
                     rectilinear_path = rectilinear_transform(df, include_velocity=(3 in cols)) # shape (n_points, 2 or 3) depending on whether velocity is included
                     tensor = torch.tensor(rectilinear_path, dtype=torch.float32, requires_grad=False)
-                    tensor[:,1:] = (tensor[:,1:] + 1.) / scale # add 1 to pitch and velocity which are integers from 0 to 127 to reserve 0 for rest and divide by scale
+                    tensor[:,1:] = (tensor[:,1:] + 1.) * scale # add 1 to pitch and velocity which are integers from 0 to 127 to reserve 0 for rest and divide by scale
                 else:
                     tensor = torch.tensor(df.iloc[:,:self.seq_dim].values, dtype=torch.float32, requires_grad=False)# (seq_len, seq_dim)
-                    tensor[:,2:] = tensor[:,2:] / scale # scale pitch and velocity which are integers from 0 to 127
+                    tensor[:,2:] = tensor[:,2:] * scale # scale pitch and velocity which are integers from 0 to 127
                 self.tensors.append(tensor)
                 self.lens.append(int((tensor.shape[0] - self.sample_len)/self.stride) + 1)
         self.lens = np.cumsum(self.lens)
@@ -674,7 +692,7 @@ class NoteDurationDataset(Dataset):
             if len(df) >= sample_len:
                 self.max_pitch = max(self.max_pitch, df['Pitch'].max())
                 tensor = torch.tensor(df.values, dtype=torch.float32, requires_grad=False)# (seq_len, seq_dim)
-                tensor[:,1:] = tensor[:,1:] / scale # pitch is an integer starting from 1 and ending at max pitch
+                tensor[:,1:] = tensor[:,1:] * scale # pitch is an integer starting from 1 and ending at max pitch
                 self.tensors.append(tensor)
                 self.lens.append(int((tensor.shape[0] - self.sample_len)/self.stride) + 1)
         self.lens = np.cumsum(self.lens)
@@ -719,7 +737,7 @@ class GapDurationDeltaPitchDataset(Dataset):
         for df in dfs:
             if len(df) >= sample_len:
                 tensor = torch.tensor(df.values, dtype=torch.float32, requires_grad=False)# (seq_len, seq_dim)
-                tensor[:,-1] = tensor[:,-1] / scale # scale pitch values accordingly
+                tensor[:,-1] = tensor[:,-1] * scale # scale pitch values accordingly
                 self.tensors.append(tensor)
                 self.lens.append(int((tensor.shape[0] - self.sample_len)/self.stride) + 1)
         self.lens = np.cumsum(self.lens)
@@ -761,7 +779,7 @@ class GapDurDpitchFullLenDataset(Dataset):
         self.lens = []
         for df in dfs:
             tensor = torch.tensor(df.values, dtype=torch.float32, requires_grad=False)# (seq_len, seq_dim)
-            tensor[:,-1] = tensor[:,-1] / scale # scale pitch values accordingly
+            tensor[:,-1] = tensor[:,-1] * scale # scale pitch values accordingly
             self.tensors.append(tensor)
 
     def __len__(self):
