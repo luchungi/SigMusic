@@ -47,20 +47,25 @@ def get_beat_duration(midi_data):
 def get_dfs_from_midi(dir: str,
                       min_notes: int=1,
                       min_gap: float=0,
-                      note_dur_transform: bool=False):
+                      melody_only: bool=False):
     '''
     Get dataframes from midi files in dir amd convert to dataframes
     Provide artist and song name in a list as a tuple in the format (artist, song)
     Filter out midi files where number of notes is less than min_notes (length of df)
     Filter out midi files where minimum gap between notes is less than min_gap (overlapping notes if negative)
-    Transform dataframes to have 2 cols: duration and pitch if note_dur_transform is True
-    0 is assumed to be reserved for rest with this transformation
+    Filter out intros, solos, outros, etc. if melody_only is True (based on file name and will filter out intro+verse files)
     '''
     dfs = []
     for entry in os.scandir(dir):
         if entry.is_dir():
-            dfs.extend(get_dfs_from_midi(entry.path, min_notes, min_gap, note_dur_transform))
+            dfs.extend(get_dfs_from_midi(entry.path, min_notes, min_gap, melody_only))
         elif entry.is_file() and (entry.name.endswith('.midi') or entry.name.endswith('.mid')):
+            if melody_only:
+                if not (entry.name.lower().startswith('verse') or
+                        entry.name.lower().startswith('chorus') or
+                        entry.name.lower().startswith('bridge') or
+                        entry.name.lower().startswith('pre-chorus')):
+                    continue
             path = entry.path
             split_path = path.split('/')
             type = split_path[-1]
@@ -75,27 +80,6 @@ def get_dfs_from_midi(dir: str,
             # filter out midi files where gap between notes is less than min_gap
             gap = df['Start'].iloc[1:].values - df['End'].iloc[:-1].values
             if len(gap) ==0 or gap.min() < min_gap: continue
-
-            if note_dur_transform:
-                rows = []
-                df.loc[:, 'Pitch'] += 1 # add 1 to pitch to reserve 0 for rest
-                prev_end = None
-                for i, row in df.iterrows():
-                    note = pd.Series({'Duration': row['End'] - row['Start'], 'Pitch': row['Pitch']})
-                    if i == 0:
-                        rows.append(note)
-                        continue
-
-                    # check if previous note ends before current note starts i.e. gap between notes
-                    if prev_end is not None:
-                        if prev_end < row['Start']:
-                            # add row with duration of gap with pitch 0 (rest)
-                            rows.append(pd.Series({'Duration': row['Start'] - prev_end, 'Pitch': 0}))
-                        elif prev_end > row['Start']:
-                            raise ValueError('Overlapping notes')
-                    prev_end = row['End']
-                    rows.append(note)
-                df = pd.DataFrame(rows)
 
             # filter out midi files where number of notes is less than min_notes
             if len(df) < min_notes: continue
