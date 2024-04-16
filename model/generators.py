@@ -95,7 +95,7 @@ class TransInc(nn.Module):
         super().__init__()
         self.gen_type = 'TransInc'
         self.noise_dim = noise_dim
-        self.seq_dim = seq_dim # dimension of the time series e.g. how many stocks
+        self.seq_dim = seq_dim # dimension of the time series
         self.seq_len = seq_len # length of the time series to generate i.e. does not include the historical data NOTE: different to LSTMRealdt
         self.hist_len = hist_len # length of historical path to feed to network (length of returns = hist_len-1)
         self.range = range
@@ -108,7 +108,7 @@ class TransInc(nn.Module):
         activation = getattr(nn, activation)
 
         self.encoded_seq_len = int((((hist_len) - kernel_size) / stride + 1))
-        self.encoder = nn.Conv1d(seq_dim+noise_dim, n_channels, kernel_size=kernel_size, stride=stride) # +1 for noise dim
+        self.encoder = nn.Conv1d(seq_dim+noise_dim+1, n_channels, kernel_size=kernel_size, stride=stride) # +1 for distance from initial node
         self.transformer_encoder_layer = nn.TransformerEncoderLayer(d_model=n_channels, nhead=n_head, dim_feedforward=hidden_size,
                                                                     dropout=0., batch_first=True, activation='gelu')
         self.transformer_encoder = nn.TransformerEncoder(self.transformer_encoder_layer, n_transformer_layers)
@@ -124,10 +124,15 @@ class TransInc(nn.Module):
 
     def _generate_sequence(self, x, noise): # (batch_size, sample_len, seq_dim))
         seq = []
-        hist_x = x[:,:self.hist_len,:].permute(0,2,1) # (batch_size, seq_dim, hist_len)
+        hist_x = torch.empty(x.shape[0], self.hist_len, x.shape[2]+1, device=x.device, requires_grad=False, dtype=x.dtype)
+        # print(f'hist_x: {hist_x.shape}')
+        hist_x[:,:,:-1] = x[:,:self.hist_len,:] # (batch_size, hist_len, seq_dim)
+        hist_x[:,:,-1] = x[:,:self.hist_len,-1].cumsum(dim=1) # distance from the initial note
+        hist_x = hist_x.permute(0,2,1) # (batch_size, seq_dim, hist_len)
+        # print(f'hist_x: {hist_x.shape}')
         hist_noise = noise[:,:self.hist_len,:].permute(0,2,1) # (batch_size, noise_dim, hist_len)
 
-        for _ in range(self.seq_len-self.hist_len):
+        for i in range(self.seq_len-self.hist_len):
             input = torch.cat([hist_x, hist_noise], dim=1)
             z = self.encoder(input).permute(0,2,1) # permute back to (batch_size, encoded_seq_len, n_channels)
             # print(z.shape)
@@ -138,7 +143,12 @@ class TransInc(nn.Module):
             seq.append(dpitch.unsqueeze(-1))
 
             hist_x = hist_x.roll(-1, dims=2)
-            hist_x[:,:,-1] = dpitch
+            hist_x[:,:-2,-1] = x[:,i+self.hist_len-1,:-2]
+            # print(hist_x[:,-2,-1].shape, dpitch.shape)
+            hist_x[:,-2,-1] = dpitch.squeeze()
+            # print(hist_x[:,-1,-1].shape, dpitch.squeeze(-1).shape)
+            hist_x[:,-1,-1] = hist_x[:,-1,-2] + dpitch.squeeze()
+            # print(hist_x)
 
         dpitch = torch.cat(seq, dim=1)
         # print(dpitch.shape)
@@ -148,6 +158,57 @@ class TransInc(nn.Module):
         # print(seq.shape)
 
         return seq
+
+    def forward(self, x, noise):
+        return self._generate_sequence(x, noise)
+
+class TransPredict(nn.Module):
+    def __init__(self, noise_dim:int, seq_dim:int, seq_len:int, hist_len:int, range:int,
+                 kernel_size:int|list[int], stride:int|list[int], n_channels:int,
+                 n_head:int, n_transformer_layers:int, hidden_size:int,
+                 activation:str):
+        '''
+        Transformer architecture with a deterministic output
+        Uses a conv1d layer to encode the input sequence into an embedding
+        Embedding is then fed into a transformer encoder
+        Transformer encoder output is then fed into a linear layer to produce the output sequence
+        '''
+        super().__init__()
+        self.gen_type = 'TransInc'
+        self.noise_dim = noise_dim
+        self.seq_dim = seq_dim # dimension of the time series
+        self.seq_len = seq_len # length of the time series to generate i.e. does not include the historical data NOTE: different to LSTMRealdt
+        self.hist_len = hist_len # length of historical path to feed to network (length of returns = hist_len-1)
+        self.range = range
+        self.kernel_size = kernel_size
+        self.n_channels = n_channels
+        self.stride = stride
+        self.n_head = n_head
+        self.n_transformer_layers = n_transformer_layers
+        self.hidden_size = hidden_size
+        activation = getattr(nn, activation)
+
+        self.encoded_seq_len = int((((hist_len) - kernel_size) / stride + 1))
+        self.encoder = nn.Conv1d(seq_dim, n_channels, kernel_size=kernel_size, stride=stride) # +1 for distance from initial node
+        self.transformer_encoder_layer = nn.TransformerEncoderLayer(d_model=n_channels, nhead=n_head, dim_feedforward=hidden_size,
+                                                                    dropout=0., batch_first=True, activation='gelu')
+        self.transformer_encoder = nn.TransformerEncoder(self.transformer_encoder_layer, n_transformer_layers)
+        self.decoder = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(self.encoded_seq_len * n_channels, hidden_size),
+            activation(),
+            nn.Linear(hidden_size, self.range*2 + 1), # (exp rate for duration, max_pitch+1 values for pitch and rest)
+            nn.Tanh()
+        )
+
+    def _generate_sequence(self, x, noise): # (batch_size, sample_len, seq_dim))
+        x = x.permute(0,2,1) # (batch_size, seq_dim, hist_len)
+        input = x
+        z = self.encoder(input).permute(0,2,1) # permute back to (batch_size, encoded_seq_len, n_channels)
+        z = self.transformer_encoder(z) # (batch_size, encoded_seq_len, n_channels)
+        # print(z.shape)
+        z = self.decoder(z) # (batch_size, 1)
+        return z
 
     def forward(self, x, noise):
         return self._generate_sequence(x, noise)
@@ -277,6 +338,8 @@ class LSTMinc(nn.Module):
         else:
             return torch.cat([hist_x, output_seq], dim=1)
 
+def f(x):
+    return x - torch.sin(2*torch.pi*x) / (2*torch.pi)
 class LSTMinc_v2(nn.Module):
     '''
     LSTM model that generates a sequence of delta pitch values
@@ -331,6 +394,7 @@ class LSTMinc_v2(nn.Module):
             z = self.output_net(output)
             # gap_duration = torch.exp(z[:,:,:2]) # ensure that the duration and pause duration are positive
             deltapitch = z * self.dpitch_range * self.scale
+            deltapitch = f(deltapitch)
             x = torch.cat([gap_duration[:,i:i+1,:], deltapitch], dim=-1)
             gen_seq.append(x)
             dist = dist + deltapitch

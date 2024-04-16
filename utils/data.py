@@ -718,12 +718,12 @@ class GapDurationDeltaPitchDataset(Dataset):
         self.sample_len = sample_len
         self.tensors = []
         self.lens = []
-        for df in dfs:
-            if len(df) >= sample_len:
-                tensor = torch.tensor(df.values, dtype=torch.float32, requires_grad=False)# (seq_len, seq_dim)
+        for i in range(len(dfs)):
+            if len(dfs[i]) >= sample_len:
+                tensor = torch.tensor(dfs[i].values, dtype=torch.float32, requires_grad=False)# (seq_len, seq_dim)
                 tensor[:,-1] = tensor[:,-1] * scale # scale pitch values accordingly
                 self.tensors.append(tensor)
-                self.lens.append(int((tensor.shape[0] - self.sample_len)/self.stride) + 1)
+                self.lens.append(int((tensor.shape[0] - self.sample_len)/self.stride) + 1) # number of samples for i-th df
         self.lens = np.cumsum(self.lens)
         self.len = self.lens[-1]
 
